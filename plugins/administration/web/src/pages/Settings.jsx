@@ -1,10 +1,55 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { useOutletContext } from 'react-router-dom';
-import { Server, Github, Shield } from 'lucide-react';
+import { useAuth } from '../hooks/useAuth';
+import { Server, Github, Shield, RotateCcw } from 'lucide-react';
+import { Button } from '../components/UI';
 
 export function GuildSettings() {
   const { guildData } = useOutletContext();
   const { guild, config } = guildData || {};
+  const { user } = useAuth();
+  const [isOwner, setIsOwner] = useState(() => {
+    const stored = localStorage.getItem('vaish_isOwner');
+    return stored === 'true';
+  });
+  const [restarting, setRestarting] = useState(false);
+
+  React.useEffect(() => {
+    async function checkOwner() {
+      try {
+        const res = await fetch('/api/me');
+        if (res.ok) {
+          const data = await res.json();
+          setIsOwner(data.isOwner || false);
+          localStorage.setItem('vaish_isOwner', String(data.isOwner || false));
+        }
+      } catch {}
+    }
+    checkOwner();
+  }, [user]);
+
+  async function handleRestart() {
+    // eslint-disable-next-line no-restricted-globals
+    const confirmed = window.confirm('Are you sure you want to restart the bot? This will briefly disconnect all services.');
+    if (!confirmed) {
+      return;
+    }
+    setRestarting(true);
+    try {
+      const res = await fetch('/api/plugins/restart', { method: 'POST' });
+      if (res.ok) {
+        // eslint-disable-next-line no-alert
+        alert('Bot is restarting...');
+      } else {
+        // eslint-disable-next-line no-alert
+        alert('Failed to restart bot. Only bot owners can do this.');
+      }
+    } catch (err) {
+      alert('Failed to restart bot');
+    } finally {
+      setRestarting(false);
+    }
+  }
 
   if (!guild) return null;
 
@@ -80,6 +125,19 @@ export function GuildSettings() {
             </button>
           </div>
         </div>
+
+        {isOwner && (
+          <div style={styles.card}>
+            <h3 style={styles.cardTitle}>Bot Administration</h3>
+            <p style={styles.exportDesc}>
+              Restart the bot process. This will briefly disconnect all services and reconnect them.
+            </p>
+            <Button onClick={handleRestart} loading={restarting} variant="danger">
+              <RotateCcw size={16} style={{ marginRight: 8 }} />
+              Restart Bot
+            </Button>
+          </div>
+        )}
       </div>
     </div>
   );

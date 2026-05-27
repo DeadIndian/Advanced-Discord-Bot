@@ -162,6 +162,53 @@ git push origin feature/amazing-new-feature
 7. **Push** to your branch
 8. **Submit** a Pull Request
 
+### Creating Plugins
+
+You can extend VAISH by creating plugins! Plugins can add commands, dashboards, and custom functionality.
+
+**Quick Start:**
+
+```bash
+# Create your plugin
+mkdir plugins/vaish-plugin-my-plugin
+cd plugins/vaish-plugin-my-plugin
+
+# Create plugin.json
+echo '{
+  "name": "vaish-plugin-my-plugin",
+  "version": "1.0.0",
+  "description": "My awesome plugin",
+  "author": "YourName",
+  "main": "index.js"
+}' > plugin.json
+
+# Create index.js
+echo 'async function load(ctx) {
+  ctx.logger.info("My plugin loaded!");
+  
+  ctx.registerCommand({
+    data: { name: "hello", description: "Say hello" },
+    async execute(interaction) {
+      await interaction.reply("Hello from my plugin!");
+    }
+  });
+}
+module.exports = { load };' > index.js
+```
+
+**Publish to npm:**
+
+```bash
+npm login
+npm publish
+```
+
+**Add to Marketplace:**
+
+Submit a PR to the [VAISH Plugin Registry](https://github.com/vaish-plugin-registry/registry) to have your plugin listed in the marketplace.
+
+See [CREATE-PLUGIN.md](./CREATE-PLUGIN.md) for complete documentation.
+
 ### Development Guidelines
 
 - **Code Style**: Consistent formatting with Prettier

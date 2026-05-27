@@ -4,9 +4,11 @@ const session = require("@fastify/session");
 const MongoStore = require("connect-mongo");
 const axios = require("axios");
 const crypto = require("crypto");
+const path = require("path");
 const { WebSocketServer } = require("ws");
-const { spawn } = require("child_process");
+const { spawn, fork } = require("child_process");
 const { createLogger } = require("../logger");
+const { registry } = require("../pluginRegistry");
 
 const ADMIN_PERMISSION = 0x8;
 const MANAGE_GUILD_PERMISSION = 0x20;
@@ -88,6 +90,10 @@ async function startApiServer({ client, db, pluginManager, hooks }) {
 	fastify.get("/auth/discord", async (request, reply) => {
 		const state = crypto.randomBytes(16).toString("hex");
 		request.session.oauthState = state;
+		
+		if (request.query.redirect) {
+			request.session.returnTo = request.query.redirect;
+		}
 
 		const params = new URLSearchParams({
 			client_id: discordClientId,
@@ -138,6 +144,12 @@ async function startApiServer({ client, db, pluginManager, hooks }) {
 		request.session.user = userResponse.data;
 		request.session.adminGuildIds = adminGuilds.map((guild) => guild.id);
 		request.session.ownerIds = ownerIds;
+
+		if (request.session.returnTo) {
+			const returnUrl = request.session.returnTo;
+			delete request.session.returnTo;
+			return reply.redirect(returnUrl);
+		}
 
 		if (dashboardRedirect) {
 			return reply.redirect(dashboardRedirect);
@@ -198,8 +210,8 @@ async function startApiServer({ client, db, pluginManager, hooks }) {
 
 	fastify.post("/api/plugins/install", async (request, reply) => {
 		const { packageName } = request.body || {};
-		if (!packageName || !packageName.startsWith("vaish-plugin-")) {
-			return reply.code(400).send({ error: "Invalid package name" });
+		if (!packageName) {
+			return reply.code(400).send({ error: "Package name required" });
 		}
 
 		const result = await runNpmInstall(
@@ -211,6 +223,31 @@ async function startApiServer({ client, db, pluginManager, hooks }) {
 		if (!result.ok) {
 			return reply.code(500).send({ error: result.error });
 		}
+
+		return { ok: true };
+	});
+
+	fastify.post("/api/plugins/uninstall", async (request, reply) => {
+		const { packageName } = request.body || {};
+		if (!packageName) {
+			return reply.code(400).send({ error: "Package name required" });
+		}
+
+		const pluginList = pluginManager.getPluginList();
+		const plugin = pluginList.find(
+			(p) => p.name === packageName || p.name === `vaish-plugin-${packageName.replace("vaish-plugin-", "")}`,
+		);
+
+		if (plugin) {
+			await pluginManager.unloadPlugin(plugin.name, "uninstall");
+		}
+
+		const result = await runNpmUninstall(packageName, logger, broadcastInstallLog);
+		if (!result.ok) {
+			return reply.code(500).send({ error: result.error });
+		}
+
+		await pluginManager.loadAll();
 
 		return { ok: true };
 	});
@@ -231,6 +268,89 @@ async function startApiServer({ client, db, pluginManager, hooks }) {
 		}
 
 		return { ok: true };
+	});
+
+	fastify.get("/api/plugins/marketplace", async (request) => {
+		const { q, category } = request.query;
+		const plugins = await registry.searchPlugins(q, category);
+		const installed = pluginManager.getPluginList();
+		const installedNames = new Set(installed.map((p) => p.name));
+
+		return {
+			plugins: plugins.map((p) => ({
+				...p,
+				installed: installedNames.has(p.npmPackage) || installedNames.has(p.name),
+			})),
+		};
+	});
+
+	fastify.get("/api/plugins/categories", async () => {
+		return { categories: registry.getCategories() };
+	});
+
+	fastify.get("/api/plugins/registry/:packageName", async (request, reply) => {
+		const plugin = await registry.getPluginDetails(request.params.packageName);
+		if (!plugin) {
+			return reply.code(404).send({ error: "Plugin not found in registry" });
+		}
+		return plugin;
+	});
+
+	fastify.post("/api/plugins/submit", async (request, reply) => {
+		const { packageName, description, author, category } = request.body || {};
+
+		if (!packageName || !description || !author) {
+			return reply.code(400).send({ error: "Missing required fields" });
+		}
+
+		if (!packageName.startsWith("vaish-plugin-")) {
+			return reply.code(400).send({ error: "Package name must start with 'vaish-plugin-'" });
+		}
+
+		return registry.submitPlugin({ packageName, description, author, category });
+	});
+
+	fastify.post("/api/plugins/restart", async (request, reply) => {
+		const ownerIds = parseOwnerIds();
+		const isOwner = ownerIds.includes(request.session.user?.id);
+
+		if (!isOwner) {
+			return reply.code(403).send({ error: "Only bot owners can restart" });
+		}
+
+		logger.info("Scheduling bot restart...");
+
+		setTimeout(() => {
+			const restartScript = path.join(__dirname, "restart-bot.js");
+			spawn("node", [restartScript], {
+				detached: true,
+				stdio: "ignore",
+				cwd: process.cwd(),
+			});
+			process.exit(0);
+		}, 1000);
+
+		return { ok: true, message: "Restarting bot..." };
+	});
+
+	fastify.get("/api/plugins/config/:pluginName", async (request, reply) => {
+		if (!requireGuildAccess(request, reply)) return;
+
+		await db.ensureConnection();
+		const config = await db.getPluginConfig(request.params.guildId, request.params.pluginName);
+		return { config: config?.data || {} };
+	});
+
+	fastify.put("/api/plugins/config/:pluginName", async (request, reply) => {
+		if (!requireGuildAccess(request, reply)) return;
+
+		await db.ensureConnection();
+		const updated = await db.updatePluginConfig(
+			request.params.guildId,
+			request.params.pluginName,
+			request.body || {},
+		);
+		return { config: updated?.data || {} };
 	});
 
 	fastify.get("/api/guild/:guildId/config", async (request, reply) => {
@@ -431,6 +551,32 @@ async function runNpmInstall(packageName, pluginManager, logger, emitLog) {
 	}
 
 	return result;
+}
+
+async function runNpmUninstall(packageName, logger, emitLog) {
+	return new Promise((resolve) => {
+		const child = spawn("npm", ["uninstall", packageName], {
+			cwd: process.cwd(),
+			shell: true,
+		});
+
+		child.stdout.on("data", (data) => {
+			emitLog({ type: "stdout", message: data.toString() });
+		});
+
+		child.stderr.on("data", (data) => {
+			emitLog({ type: "stderr", message: data.toString() });
+		});
+
+		child.on("close", (code) => {
+			if (code === 0) {
+				logger.info(`Uninstalled ${packageName}`);
+				resolve({ ok: true });
+			} else {
+				resolve({ ok: false, error: `npm uninstall exited with code ${code}` });
+			}
+		});
+	});
 }
 
 module.exports = { startApiServer };

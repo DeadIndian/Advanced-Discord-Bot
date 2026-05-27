@@ -6,6 +6,8 @@ const axios = require("axios");
 const crypto = require("crypto");
 const path = require("path");
 const fs = require("fs");
+const { spawn } = require("child_process");
+const { registry } = require("../../core/pluginRegistry");
 
 const ADMIN_PERMISSION = 0x8;
 const MANAGE_GUILD_PERMISSION = 0x20;
@@ -29,28 +31,14 @@ function hasGuildPermission(guild) {
 
 async function load(ctx) {
   const port = ctx.config.env.ADMINISTRATION_PORT || 50000;
-  const sessionSecret =
-    ctx.config.env.ADMINISTRATION_SESSION_SECRET ||
-    ctx.config.env.SESSION_SECRET;
-  const discordClientId =
-    ctx.config.env.ADMINISTRATION_OAUTH_CLIENT_ID ||
-    ctx.config.env.DISCORD_OAUTH_CLIENT_ID;
-  const discordClientSecret =
-    ctx.config.env.ADMINISTRATION_OAUTH_CLIENT_SECRET ||
-    ctx.config.env.DISCORD_OAUTH_CLIENT_SECRET;
-  const discordRedirectUri =
-    ctx.config.env.ADMINISTRATION_OAUTH_REDIRECT_URI ||
-    `http://localhost:${port}/auth/discord/callback`;
+  const sessionSecret = ctx.config.env.SESSION_SECRET;
   const botApiUrl =
     ctx.config.env.ADMINISTRATION_BOT_API_URL ||
     `http://localhost:${ctx.config.env.BOT_API_PORT || 3210}`;
 
-  if (!sessionSecret || !discordClientId || !discordClientSecret) {
+  if (!sessionSecret) {
     ctx.logger.warn(
-      "Administration panel disabled - missing OAuth/session environment variables"
-    );
-    ctx.logger.warn(
-      "Required: SESSION_SECRET (or ADMINISTRATION_SESSION_SECRET), DISCORD_OAUTH_CLIENT_ID (or ADMINISTRATION_OAUTH_CLIENT_ID), DISCORD_OAUTH_CLIENT_SECRET (or ADMINISTRATION_OAUTH_CLIENT_SECRET)"
+      "Administration panel disabled - missing SESSION_SECRET environment variable"
     );
     return;
   }
@@ -59,17 +47,17 @@ async function load(ctx) {
 
   const sessionStore = MongoStore.create({
     mongoUrl: ctx.config.env.MONGODB_URI,
-    collectionName: "admin_sessions",
+    collectionName: "vaish_sessions",
   });
 
   await fastify.register(cookie);
   await fastify.register(session, {
     secret: sessionSecret,
-    cookieName: "admin.sid",
+    cookieName: "vaish.sid",
     cookie: {
       path: "/",
       httpOnly: true,
-      sameSite: "lax",
+      sameSite: ctx.config.env.NODE_ENV === "production" ? "lax" : false,
       secure: ctx.config.env.NODE_ENV === "production",
     },
     store: sessionStore,
@@ -88,77 +76,9 @@ async function load(ctx) {
   fastify.get("/health", async () => ({ status: "ok", plugin: "administration" }));
 
   fastify.get("/auth/discord", async (request, reply) => {
-    const state = crypto.randomBytes(16).toString("hex");
-    request.session.oauthState = state;
-
-    const params = new URLSearchParams({
-      client_id: discordClientId,
-      redirect_uri: discordRedirectUri,
-      response_type: "code",
-      scope: "identify guilds",
-      state,
-    });
-
     return reply.redirect(
-      `https://discord.com/api/oauth2/authorize?${params}`
+      `${botApiUrl}/auth/discord?redirect=http://localhost:${port}`
     );
-  });
-
-  fastify.get("/auth/discord/callback", async (request, reply) => {
-    const { code, state } = request.query;
-
-    if (!code || !state || state !== request.session.oauthState) {
-      return reply.code(400).send({ error: "Invalid OAuth state" });
-    }
-
-    try {
-      const tokenResponse = await axios.post(
-        "https://discord.com/api/oauth2/token",
-        new URLSearchParams({
-          client_id: discordClientId,
-          client_secret: discordClientSecret,
-          grant_type: "authorization_code",
-          code,
-          redirect_uri: discordRedirectUri,
-        }).toString(),
-        {
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        }
-      );
-
-      const accessToken = tokenResponse.data.access_token;
-
-      const [userResponse, guildsResponse] = await Promise.all([
-        axios.get("https://discord.com/api/users/@me", {
-          headers: { Authorization: `Bearer ${accessToken}` },
-        }),
-        axios.get("https://discord.com/api/users/@me/guilds", {
-          headers: { Authorization: `Bearer ${accessToken}` },
-        }),
-      ]);
-
-      const ownerIds = parseOwnerIds();
-      const adminGuilds = guildsResponse.data.filter(hasGuildPermission);
-      const botGuilds = ctx.client.guilds.cache.map((g) => g.id);
-
-      const managedGuilds = adminGuilds.filter((g) =>
-        botGuilds.includes(g.id)
-      );
-
-      request.session.user = userResponse.data;
-      request.session.adminGuildIds = managedGuilds.map((g) => g.id);
-      request.session.ownerIds = ownerIds;
-      request.session.guildData = managedGuilds.map((g) => ({
-        id: g.id,
-        name: g.name,
-        icon: g.icon,
-      }));
-
-      return reply.redirect("/");
-    } catch (error) {
-      ctx.logger.error("OAuth callback error:", error);
-      return reply.code(500).send({ error: "OAuth authentication failed" });
-    }
   });
 
   fastify.post("/auth/logout", async (request) => {
@@ -171,9 +91,24 @@ async function load(ctx) {
       return reply.code(401).send({ error: "unauthorized" });
     }
 
+    const guildIds = request.session.adminGuildIds || (request.session.guildData ? request.session.guildData.map(g => g.id) : []);
+    const botGuilds = ctx.client.guilds.cache;
+    const guilds = guildIds
+      .filter((id) => botGuilds.has(id))
+      .map((id) => {
+        const discordGuild = botGuilds.get(id);
+        return {
+          id: discordGuild.id,
+          name: discordGuild.name,
+          icon: discordGuild.icon || (discordGuild.iconURL ? discordGuild.iconURL() : null),
+        };
+      });
+
+    console.log("[DEBUG] /api/me returning guilds:", guilds);
+
     return {
       user: request.session.user,
-      guilds: request.session.guildData || [],
+      guilds: guilds,
       isOwner:
         request.session.ownerIds?.includes(request.session.user?.id) || false,
     };
@@ -195,7 +130,7 @@ async function load(ctx) {
       return true;
     }
 
-    const allowed = request.session.adminGuildIds || [];
+    const allowed = request.session.adminGuildIds || (request.session.guildData ? request.session.guildData.map(g => g.id) : []);
     if (!allowed.includes(guildId)) {
       reply.code(403).send({ error: "forbidden" });
       return false;
@@ -205,17 +140,24 @@ async function load(ctx) {
   };
 
   fastify.get("/api/guilds", async (request) => {
-    const guilds = (request.session.guildData || []).map((g) => {
-      const discordGuild = ctx.client.guilds.cache.get(g.id);
-      return {
-        ...g,
-        memberCount: discordGuild?.memberCount || 0,
-        online:
-          discordGuild?.members.cache.filter(
-            (m) => m.presence?.status !== "offline"
-          ).size || 0,
-      };
-    });
+    const guildIds = request.session.adminGuildIds || (request.session.guildData ? request.session.guildData.map(g => g.id) : []);
+    const botGuilds = ctx.client.guilds.cache;
+
+    const guilds = guildIds
+      .filter((id) => botGuilds.has(id))
+      .map((id) => {
+        const discordGuild = botGuilds.get(id);
+        return {
+          id: discordGuild.id,
+          name: discordGuild.name,
+          icon: discordGuild.icon || (discordGuild.iconURL ? discordGuild.iconURL() : null),
+          memberCount: discordGuild?.memberCount || 0,
+          online:
+            discordGuild?.members.cache.filter(
+              (m) => m.presence?.status !== "offline"
+            ).size || 0,
+        };
+      });
 
     return { guilds };
   });
@@ -458,10 +400,163 @@ async function load(ctx) {
     }
   );
 
-  fastify.setNotFoundHandler((request, reply) => {
+  fastify.get("/api/plugins", async () => {
+    return { plugins: ctx.pluginManager.getPluginList() };
+  });
+
+  fastify.get("/api/plugins/marketplace", async (request) => {
+    const { q, category } = request.query;
+    const plugins = await registry.searchPlugins(q, category);
+    const installed = ctx.pluginManager.getPluginList();
+    const installedNames = new Set(installed.map((p) => p.name));
+
+    return {
+      plugins: plugins.map((p) => ({
+        ...p,
+        installed: installedNames.has(p.npmPackage) || installedNames.has(p.name),
+      })),
+    };
+  });
+
+  fastify.get("/api/plugins/categories", async () => {
+    return { categories: registry.getCategories() };
+  });
+
+  fastify.post("/api/plugins/install", async (request, reply) => {
+    const { packageName } = request.body || {};
+    if (!packageName) {
+      return reply.code(400).send({ error: "Package name required" });
+    }
+
+    return new Promise((resolve) => {
+      const child = spawn("npm", ["install", packageName], {
+        cwd: process.cwd(),
+        shell: true,
+      });
+
+      let output = "";
+      child.stdout.on("data", (data) => {
+        output += data.toString();
+      });
+      child.stderr.on("data", (data) => {
+        output += data.toString();
+      });
+
+      child.on("close", async (code) => {
+        if (code === 0) {
+          try {
+            await ctx.pluginManager.loadAll();
+            resolve({ ok: true });
+          } catch (err) {
+            resolve({ ok: false, error: "Failed to load plugins" });
+          }
+        } else {
+          resolve({ ok: false, error: `npm install failed: ${output}` });
+        }
+      });
+    });
+  });
+
+  fastify.post("/api/plugins/uninstall", async (request, reply) => {
+    const { packageName } = request.body || {};
+    if (!packageName) {
+      return reply.code(400).send({ error: "Package name required" });
+    }
+
+    return new Promise((resolve) => {
+      const child = spawn("npm", ["uninstall", packageName], {
+        cwd: process.cwd(),
+        shell: true,
+      });
+
+      child.on("close", async (code) => {
+        if (code === 0) {
+          try {
+            await ctx.pluginManager.loadAll();
+            resolve({ ok: true });
+          } catch (err) {
+            resolve({ ok: false, error: "Failed to reload plugins" });
+          }
+        } else {
+          resolve({ ok: false, error: "npm uninstall failed" });
+        }
+      });
+    });
+  });
+
+  fastify.post("/api/plugins/unload/:name", async (request, reply) => {
+    const ok = await ctx.pluginManager.unloadPlugin(request.params.name, "api");
+    if (!ok) {
+      return reply.code(404).send({ error: "Plugin not unloaded" });
+    }
+    return { ok: true };
+  });
+
+  fastify.post("/api/plugins/reload/:name", async (request, reply) => {
+    const ok = await ctx.pluginManager.reloadPlugin(request.params.name);
+    if (!ok) {
+      return reply.code(409).send({ error: "Plugin not reloadable" });
+    }
+    return { ok: true };
+  });
+
+  fastify.post("/api/plugins/submit", async (request, reply) => {
+    const { packageName, description, author, category } = request.body || {};
+    if (!packageName || !description || !author) {
+      return reply.code(400).send({ error: "Missing required fields" });
+    }
+    if (!packageName.startsWith("vaish-plugin-")) {
+      return reply.code(400).send({ error: "Package name must start with 'vaish-plugin-'" });
+    }
+    return registry.submitPlugin({ packageName, description, author, category });
+  });
+
+  fastify.post("/api/plugins/restart", async (request, reply) => {
+    const ownerIds = parseOwnerIds();
+    const isOwner = ownerIds.includes(request.session.user?.id);
+    if (!isOwner) {
+      return reply.code(403).send({ error: "Only bot owners can restart" });
+    }
+
+    ctx.logger.info("Scheduling bot restart...");
+    setTimeout(() => {
+      const restartScript = path.join(__dirname, "..", "..", "core", "api", "restart-bot.js");
+      spawn("node", [restartScript], {
+        detached: true,
+        stdio: "ignore",
+        cwd: process.cwd(),
+      });
+      process.exit(0);
+    }, 1000);
+
+    return { ok: true, message: "Restarting bot..." };
+  });
+
+  fastify.get("/api/plugins/config/:pluginName", async (request, reply) => {
+    if (!requireGuildAccess(request, reply)) return;
+    await ctx.db.ensureConnection();
+    const config = await ctx.db.getPluginConfig(request.params.guildId, request.params.pluginName);
+    return { config: config?.data || {} };
+  });
+
+  fastify.put("/api/plugins/config/:pluginName", async (request, reply) => {
+    if (!requireGuildAccess(request, reply)) return;
+    await ctx.db.ensureConnection();
+    const updated = await ctx.db.updatePluginConfig(
+      request.params.guildId,
+      request.params.pluginName,
+      request.body || {},
+    );
+    return { config: updated?.data || {} };
+  });
+
+  fastify.setNotFoundHandler(async (request, reply) => {
+    if (request.url.startsWith("/api/")) {
+      return reply.code(404).send({ error: "Not found" });
+    }
     const indexPath = path.join(webDir, "index.html");
     if (fs.existsSync(indexPath)) {
-      return reply.sendFile("index.html");
+      return reply.code(200).type("text/html").send(fs.readFileSync(indexPath));
     }
     return reply.code(404).send({ error: "Not found" });
   });

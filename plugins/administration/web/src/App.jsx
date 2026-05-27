@@ -12,6 +12,7 @@ import { BirthdaySettings } from './pages/BirthdaySettings';
 import { AntiRaidSettings } from './pages/AntiRaidSettings';
 import { ActivityLogs } from './pages/ActivityLogs';
 import { GuildSettings } from './pages/Settings';
+import { Plugins } from './pages/Plugins';
 import { GuildPicker } from './components/GuildPicker';
 
 function AppRoutes() {
@@ -49,6 +50,7 @@ function AppRoutes() {
         <Route path="guild/:guildId/antiraid" element={<AntiRaidSettings />} />
         <Route path="guild/:guildId/logs" element={<ActivityLogs />} />
         <Route path="guild/:guildId/settings" element={<GuildSettings />} />
+        <Route path="guild/:guildId/plugins" element={<Plugins />} />
       </Route>
     </Routes>
   );

@@ -10,6 +10,7 @@ import {
   ShieldAlert,
   Activity,
   Settings,
+  Puzzle,
 } from 'lucide-react';
 
 const navItems = [
@@ -21,6 +22,7 @@ const navItems = [
   { to: 'birthdays', icon: Cake, label: 'Birthdays' },
   { to: 'antiraid', icon: ShieldAlert, label: 'Anti-Raid' },
   { to: 'logs', icon: Activity, label: 'Activity Logs' },
+  { to: 'plugins', icon: Puzzle, label: 'Plugins' },
   { to: 'settings', icon: Settings, label: 'Settings' },
 ];
 
@@ -40,10 +42,12 @@ export function Sidebar({ guild }) {
         <div style={styles.guildId}>ID: {guild.id}</div>
       </div>
       <nav style={styles.nav}>
-        {navItems.map((item) => (
+        {navItems.map((item) => {
+          const path = item.to ? `/guild/${guild.id}/${item.to}` : `/guild/${guild.id}`;
+          return (
           <NavLink
             key={item.to}
-            to={item.to}
+            to={path}
             end={item.to === ''}
             style={({ isActive }) => ({
               ...styles.navLink,
@@ -53,7 +57,8 @@ export function Sidebar({ guild }) {
             <item.icon size={18} />
             <span>{item.label}</span>
           </NavLink>
-        ))}
+          );
+        })}
       </nav>
     </aside>
   );
